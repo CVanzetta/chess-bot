@@ -17,11 +17,11 @@ tensorboard_callback = keras.callbacks.TensorBoard(log_dir=log_dir, histogram_fr
 file_writer = tf.summary.create_file_writer(log_dir)
 
 # Charger Stockfish
-engine_path = "D:/Code/stockfish/stockfish-windows-x86-64.exe"  # Ajustez le chemin si nécessaire"  # Ajustez le chemin si nécessaire"  # Ajustez le chemin si nécessaire
+engine_path = "D:/Code/stockfish/stockfish-windows-x86-64-avx2"
 engine = chess.engine.SimpleEngine.popen_uci(engine_path)
 
 # Régler le niveau de Stockfish (de 1 à 20)
-engine.configure({"Skill Level": 5, "Threads": 4, "Hash": 512})  # Optimisations
+engine.configure({"Skill Level": 1, "Threads": 4, "Hash": 512})  # Optimisations
 
 # Variable pour suivre l'état d'exécution
 shutdown_flag = False
@@ -31,10 +31,12 @@ def signal_handler(sig, frame):
     global shutdown_flag
     shutdown_flag = True
     print("\nInterruption détectée. Fermeture en cours...")
-    engine.quit()
-    sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+# Gestion de l'epsilon décroissant
+def get_epsilon(total_games, initial_epsilon=0.1, min_epsilon=0.01, decay_rate=0.0005):
+    return max(min_epsilon, initial_epsilon * np.exp(-decay_rate * total_games))
 
 def get_piece_value(piece):
     """Retourne la valeur d'une pièce capturée."""
@@ -60,7 +62,7 @@ def play_game(bot1, engine):
     total_reward = 0
     current_player = 'bot'  # Le bot commence la partie
 
-    while not board.is_game_over():
+    while not board.is_game_over() and not shutdown_flag:
         # Stocker l'état actuel de l'échiquier avant le coup
         state_vector = board_to_vector(board)
         states.append(state_vector)
@@ -91,18 +93,19 @@ def play_game(bot1, engine):
         moves_count += 1
 
     # Déterminer la récompense en fonction du résultat
-    result = board.result()  # "1-0", "0-1" ou "1/2-1/2"
-    if result == "1-0":  # Bot 1 gagne
-        total_reward += 10
-    elif result == "0-1":  # Bot 1 perd
-        total_reward -= 10
+    if not shutdown_flag:
+        result = board.result()  # "1-0", "0-1" ou "1/2-1/2"
+        if result == "1-0":  # Bot 1 gagne
+            total_reward += 10
+        elif result == "0-1":  # Bot 1 perd
+            total_reward -= 10
 
     return states, moves_taken, total_reward, moves_count
 
-def simulate_game(episode):
+def simulate_game(episode, epsilon):
     """Fonction exécutée en parallèle pour simuler une partie entre Bot 1 et Stockfish"""
     model1 = create_model()  # Crée le modèle localement dans chaque processus
-    bot1 = ChessBot(model1, epsilon=0.1)
+    bot1 = ChessBot(model1, epsilon=epsilon)
 
     # Jouer une partie contre Stockfish
     states, moves_taken, reward, moves_count = play_game(bot1, engine)
@@ -116,7 +119,7 @@ if __name__ == '__main__':
         victories = 0
         total_games = 0
         win_rate_100 = 0  # Pour stocker le taux de victoire après chaque 100 parties
-        replay_buffer = deque(maxlen=10000)  # Taille maximale du buffer de relecture
+        replay_buffer = deque(maxlen=50000)  # Taille maximale du buffer de relecture
 
         # Utilisation de `concurrent.futures` pour exécuter plusieurs parties en parallèle
         while not shutdown_flag:
@@ -128,8 +131,10 @@ if __name__ == '__main__':
             else:
                 max_workers = 6
 
+            epsilon = get_epsilon(total_games)
+
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(simulate_game, episode) for episode in range(20)]  # Simuler 20 parties
+                futures = [executor.submit(simulate_game, episode, epsilon) for episode in range(20)]  # Simuler 20 parties
 
                 for future in concurrent.futures.as_completed(futures):
                     if shutdown_flag:
@@ -159,9 +164,9 @@ if __name__ == '__main__':
                         replay_buffer.append((state, move, reward))
 
                     # Entraîner Bot 1 toutes les 10 parties
-                    if total_games % 10 == 0 and len(replay_buffer) >= 10:
+                    if total_games % 10 == 0 and len(replay_buffer) >= 20:
                         X_train, y_train = [], []
-                        mini_batch = random.sample(replay_buffer, 10)
+                        mini_batch = random.sample(replay_buffer, 20)
 
                         N = 64 * 64 * 6  # Nombre total de coups possibles
 
@@ -192,5 +197,9 @@ if __name__ == '__main__':
 
     finally:
         # Fermer le moteur Stockfish même en cas d'exception ou d'interruption
-        engine.quit()
+        try:
+            if engine is not None:
+                engine.quit()
+        except chess.engine.EngineTerminatedError:
+            print("Erreur lors de la fermeture du moteur Stockfish : engine event loop dead")
         print("Moteur Stockfish fermé.")
