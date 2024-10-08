@@ -2,7 +2,7 @@ import random
 import chess.engine
 import numpy as np
 from chess_bot_model import create_model
-from chess_bot import ChessBot, board_to_vector, move_to_index
+from chess_bot_module import ChessBot, board_to_vector, move_to_index
 import concurrent.futures
 import tensorflow as tf
 from tensorflow import keras
@@ -17,7 +17,7 @@ tensorboard_callback = keras.callbacks.TensorBoard(log_dir=log_dir, histogram_fr
 file_writer = tf.summary.create_file_writer(log_dir)
 
 # Charger Stockfish
-engine_path = "C:/Users/C_VANZETTA/stockfish/stockfish-windows-x86-64-sse41-popcnt.exe"  # Ajustez le chemin si nécessaire
+engine_path = "D:/Code/stockfish/stockfish-windows-x86-64.exe"  # Ajustez le chemin si nécessaire"  # Ajustez le chemin si nécessaire"  # Ajustez le chemin si nécessaire
 engine = chess.engine.SimpleEngine.popen_uci(engine_path)
 
 # Régler le niveau de Stockfish (de 1 à 20)
