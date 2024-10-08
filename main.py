@@ -5,12 +5,15 @@ from chess_bot_model import create_model
 from chess_bot import ChessBot, board_to_vector, move_to_index
 import concurrent.futures
 import tensorflow as tf
+from tensorflow import keras
 import signal
 import sys
+import psutil
+from collections import deque
 
 # Définir le répertoire des logs pour TensorBoard
 log_dir = "logs/fit/"
-tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+tensorboard_callback = keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
 file_writer = tf.summary.create_file_writer(log_dir)
 
 # Charger Stockfish
@@ -18,7 +21,7 @@ engine_path = "C:/Users/C_VANZETTA/stockfish/stockfish-windows-x86-64-sse41-popc
 engine = chess.engine.SimpleEngine.popen_uci(engine_path)
 
 # Régler le niveau de Stockfish (de 1 à 20)
-engine.configure({"Skill Level": 5, "Threads": 2, "Hash": 256})  # Optimisations
+engine.configure({"Skill Level": 5, "Threads": 4, "Hash": 512})  # Optimisations
 
 # Variable pour suivre l'état d'exécution
 shutdown_flag = False
@@ -76,7 +79,7 @@ def play_game(bot1, engine):
             current_player = 'stockfish'
         else:
             # Stockfish joue
-            result = engine.play(board, chess.engine.Limit(time=1.0))
+            result = engine.play(board, chess.engine.Limit(time=0.5))  # Temps de réflexion réduit pour plus de parties
             move = result.move
             captured_piece = board.piece_at(move.to_square)
             board.push(move)
@@ -96,8 +99,9 @@ def play_game(bot1, engine):
 
     return states, moves_taken, total_reward, moves_count
 
-def simulate_game(episode, model1):
+def simulate_game(episode):
     """Fonction exécutée en parallèle pour simuler une partie entre Bot 1 et Stockfish"""
+    model1 = create_model()  # Crée le modèle localement dans chaque processus
     bot1 = ChessBot(model1, epsilon=0.1)
 
     # Jouer une partie contre Stockfish
@@ -112,57 +116,73 @@ if __name__ == '__main__':
         victories = 0
         total_games = 0
         win_rate_100 = 0  # Pour stocker le taux de victoire après chaque 100 parties
+        replay_buffer = deque(maxlen=10000)  # Taille maximale du buffer de relecture
 
         # Utilisation de `concurrent.futures` pour exécuter plusieurs parties en parallèle
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(simulate_game, episode, model1) for episode in range(200)]  # Simuler X parties
+        while not shutdown_flag:
+            cpu_usage = psutil.cpu_percent(interval=1)
+            if cpu_usage < 50:
+                max_workers = 8
+            elif cpu_usage > 75:
+                max_workers = 4
+            else:
+                max_workers = 6
 
-            for future in concurrent.futures.as_completed(futures):
-                if shutdown_flag:
-                    break
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(simulate_game, episode) for episode in range(20)]  # Simuler 20 parties
 
-                try:
-                    states, moves_taken, reward, moves_count = future.result()
-                except Exception as e:
-                    print(f"Erreur dans une partie : {e}")
-                    continue  # Passer à la partie suivante si une erreur se produit
+                for future in concurrent.futures.as_completed(futures):
+                    if shutdown_flag:
+                        break
 
-                # Calculer le taux de victoire pour Bot 1
-                if reward > 0:
-                    victories += 1
-                total_games += 1
-                win_rate = victories / total_games
+                    try:
+                        states, moves_taken, reward, moves_count = future.result()
+                    except Exception as e:
+                        print(f"Erreur dans une partie : {e}")
+                        continue  # Passer à la partie suivante si une erreur se produit
 
-                # Suivi dans la console
-                print(f"Partie {total_games}/200 terminée : reward = {reward}, moves = {moves_count}, win_rate = {win_rate:.2f}")
+                    # Calculer le taux de victoire pour Bot 1
+                    if reward > 0:
+                        victories += 1
+                    total_games += 1
+                    win_rate = victories / total_games
 
-                # Enregistrer les métriques dans TensorBoard
-                log_metrics(total_games, reward, moves_count, win_rate, file_writer)
+                    # Suivi dans la console
+                    print(f"Partie {total_games} terminée : reward = {reward}, moves = {moves_count}, win_rate = {win_rate:.2f}")
 
-                # Entraîner Bot 1 après chaque partie
-                X_train = []
-                y_train = []
+                    # Enregistrer les métriques dans TensorBoard
+                    if total_games % 10 == 0:
+                        log_metrics(total_games, reward, moves_count, win_rate, file_writer)
 
-                N = 64 * 64 * 6  # Nombre total de coups possibles
+                    # Ajouter à la mémoire de relecture
+                    for state, move in zip(states, moves_taken):
+                        replay_buffer.append((state, move, reward))
 
-                for state, move in zip(states, moves_taken):
-                    X_train.append(state)
-                    target = np.zeros(N)
-                    index = move_to_index(move)
-                    target[index] = reward  # Assigner la récompense au coup joué
-                    y_train.append(target)
+                    # Entraîner Bot 1 toutes les 10 parties
+                    if total_games % 10 == 0 and len(replay_buffer) >= 10:
+                        X_train, y_train = [], []
+                        mini_batch = random.sample(replay_buffer, 10)
 
-                X_train = np.array(X_train)
-                y_train = np.array(y_train)
-                model1.fit(X_train, y_train, epochs=1, verbose=0, callbacks=[tensorboard_callback])
+                        N = 64 * 64 * 6  # Nombre total de coups possibles
 
-                # Calculer et afficher le win rate toutes les 100 parties
-                if total_games % 100 == 0:
-                    win_rate_100 = victories / total_games
-                    print(f"Taux de victoire après {total_games} parties : {win_rate_100:.2f}")
+                        for state, move, reward in mini_batch:
+                            X_train.append(state)
+                            target = np.zeros(N)
+                            index = move_to_index(move)
+                            target[index] = reward
+                            y_train.append(target)
 
-                    # Enregistrer le win rate des 100 dernières parties dans TensorBoard
-                    log_metrics(total_games, reward, moves_count, win_rate_100, file_writer)
+                        X_train = np.array(X_train)
+                        y_train = np.array(y_train)
+                        model1.fit(X_train, y_train, epochs=1, verbose=0, callbacks=[tensorboard_callback])
+
+                    # Calculer et afficher le win rate toutes les 100 parties
+                    if total_games % 100 == 0:
+                        win_rate_100 = victories / total_games
+                        print(f"Taux de victoire après {total_games} parties : {win_rate_100:.2f}")
+
+                        # Enregistrer le win rate des 100 dernières parties dans TensorBoard
+                        log_metrics(total_games, reward, moves_count, win_rate_100, file_writer)
 
         # Message de fin lorsque toutes les parties sont terminées
         print(f"Fin de l'entraînement : taux de victoire final = {win_rate:.2f} après {total_games} parties.")
